@@ -379,6 +379,27 @@ struct child_sa_t {
 	sec_label_t *(*get_label)(child_sa_t *this);
 
 	/**
+	 * Get the CPU ID used with this CHILD_SA.
+	 *
+	 * @return				CPU used with this CHILD_SA
+	 */
+	uint32_t (*get_cpu)(child_sa_t *this);
+
+	/**
+	 * Get number of per-CPU SAs negotiated for this CHILD_SA.
+	 *
+	 * @return				number of CPUs negotiated
+	 */
+	uint32_t (*get_num_cpus)(child_sa_t *this);
+
+	/**
+	 * Set number of per-CPU SAs negotiated for this CHILD_SA.
+	 *
+	 * @param num_cpus		number of CPUs negotiated
+	 */
+	void (*set_num_cpus)(child_sa_t *this, uint32_t num_cpus);
+
+	/**
 	 * Create an enumerator over traffic selectors of one side.
 	 *
 	 * @param local		TRUE for own traffic selectors, FALSE for remote.
@@ -546,6 +567,10 @@ struct child_sa_create_t {
 	uint32_t if_id_out_def;
 	/** Optional security label to apply on SAs (cloned) */
 	sec_label_t *label;
+	/** Optional number of per-CPU SAs negotiated */
+	uint32_t num_cpus;
+	/** Optional CPU ID, CPU_ID_MAX if not specified */
+	uint32_t cpu;
 	/** TRUE to enable UDP encapsulation (NAT traversal) */
 	bool encap;
 };
