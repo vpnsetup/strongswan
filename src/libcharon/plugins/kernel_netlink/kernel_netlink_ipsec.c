@@ -534,6 +534,9 @@ struct policy_sa_t {
 	/** Type of the policy */
 	policy_type_t type;
 
+	/** Whether to trigger per-CPU acquires for this policy */
+	bool pcpu_acquires;
+
 	/** Assigned SA */
 	ipsec_sa_t *sa;
 };
@@ -554,12 +557,13 @@ struct policy_sa_out_t {
 };
 
 /**
- * Create a policy_sa(_in)_t object
+ * Create a policy_sa(_out)_t object
  */
 static policy_sa_t *policy_sa_create(private_kernel_netlink_ipsec_t *this,
 	policy_dir_t dir, policy_type_t type, host_t *src, host_t *dst,
 	traffic_selector_t *src_ts, traffic_selector_t *dst_ts, mark_t mark,
-	uint32_t if_id, hw_offload_t hw_offload, ipsec_sa_cfg_t *cfg)
+	uint32_t if_id, hw_offload_t hw_offload, bool pcpu_acquires,
+	ipsec_sa_cfg_t *cfg)
 {
 	policy_sa_t *policy;
 
@@ -577,6 +581,7 @@ static policy_sa_t *policy_sa_create(private_kernel_netlink_ipsec_t *this,
 		INIT(policy, .priority = 0);
 	}
 	policy->type = type;
+	policy->pcpu_acquires = pcpu_acquires;
 	policy->sa = ipsec_sa_create(this, src, dst, mark, if_id, hw_offload, cfg);
 	return policy;
 }
@@ -1001,7 +1006,6 @@ static void process_acquire(private_kernel_netlink_ipsec_t *this,
 			break;
 		default:
 			/* acquire for AH/ESP only, not for IPCOMP */
-
 			return;
 	}
 	data.src = selector2ts(&acquire->sel, TRUE);
@@ -2923,6 +2927,11 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 	policy_info->sel = policy->sel;
 	policy_info->dir = policy->direction;
 
+	if (mapping->pcpu_acquires)
+	{
+		policy_info->flags |= XFRM_POLICY_CPU_ACQUIRE;
+	}
+
 	/* calculate priority based on selector size, small size = high prio */
 	policy_info->priority = mapping->priority;
 	policy_info->action = mapping->type != POLICY_DROP ? XFRM_POLICY_ALLOW
@@ -2979,8 +2988,9 @@ static status_t add_policy_internal(private_kernel_netlink_ipsec_t *this,
 			tmpl->reqid = ipsec->cfg.reqid;
 			tmpl->id.proto = protos[i].proto;
 			/* in order to match SAs with all matching labels, we can't have the
-			 * SPI in the template */
-			if (policy->direction == POLICY_OUT && !policy->label)
+			 * SPI in the template, similarly for per-CPU policies and sub-SAs */
+			if (policy->direction == POLICY_OUT && !policy->label &&
+				!mapping->pcpu_acquires)
 			{
 				tmpl->id.spi = protos[i].spi;
 			}
@@ -3126,7 +3136,8 @@ METHOD(kernel_ipsec_t, add_policy, status_t,
 	/* cache the assigned IPsec SA */
 	assigned_sa = policy_sa_create(this, id->dir, data->type, data->src,
 								   data->dst, id->src_ts, id->dst_ts, id->mark,
-								   id->if_id, data->hw_offload, data->sa);
+								   id->if_id, data->hw_offload,
+								   data->pcpu_acquires, data->sa);
 	assigned_sa->auto_priority = get_priority(policy, data->prio, id->interface);
 	assigned_sa->priority = this->get_priority ? this->get_priority(id, data)
 											   : data->manual_prio;
@@ -3359,6 +3370,7 @@ METHOD(kernel_ipsec_t, del_policy, status_t,
 		if (priority == mapping->priority &&
 			auto_priority == mapping->auto_priority &&
 			data->type == mapping->type &&
+			data->pcpu_acquires == mapping->pcpu_acquires &&
 			ipsec_sa_equals(mapping->sa, &assigned_sa))
 		{
 			current->used_by->remove_at(current->used_by, enumerator);
