@@ -16,12 +16,15 @@
  * for more details.
  */
 
+#include <unistd.h>
+
 #include "child_create.h"
 
 #include <daemon.h>
 #include <sa/ikev2/keymat_v2.h>
 #include <crypto/key_exchange.h>
 #include <credentials/certificates/x509.h>
+#include <collections/hashtable.h>
 #include <encoding/payloads/sa_payload.h>
 #include <encoding/payloads/ke_payload.h>
 #include <encoding/payloads/ts_payload.h>
@@ -113,6 +116,21 @@ struct private_child_create_t {
 	 * destination of triggering packet
 	 */
 	traffic_selector_t *packet_tsr;
+
+	/**
+	 * proposed number of queues
+	 */
+	uint32_t num_queues;
+
+	/**
+	 * queue info sent by the peer
+	 */
+	chunk_t queue_info;
+
+	/**
+	 * whether we received queue info (might be empty)
+	 */
+	bool queue_info_seen;
 
 	/**
 	 * optional diffie hellman exchange
@@ -222,6 +240,8 @@ static void schedule_delayed_retry(private_child_create_t *this)
 	task->use_marks(task, this->child.mark_in, this->child.mark_out);
 	task->use_if_ids(task, this->child.if_id_in, this->child.if_id_out);
 	task->use_label(task, this->child.label);
+	task->use_num_cpus(task, this->child.num_cpus);
+	task->use_cpu(task, this->child.cpu);
 
 	DBG1(DBG_IKE, "creating CHILD_SA failed, trying again in %d seconds",
 		 retry);
@@ -806,6 +826,98 @@ static status_t select_and_install(private_child_create_t *this,
 }
 
 /**
+ * Look for a duplicate for the given config and determine the negotiated number
+ * of CPUs.
+ */
+static uint32_t get_num_cpus(private_child_create_t *this)
+{
+	enumerator_t *enumerator;
+	child_sa_t *child_sa;
+	uint32_t num_cpus = 0;
+
+	enumerator = this->ike_sa->create_child_sa_enumerator(this->ike_sa);
+	while (enumerator->enumerate(enumerator, (void**)&child_sa))
+	{
+		if (child_sa->get_state(child_sa) == CHILD_INSTALLED &&
+			this->config->equals(this->config, child_sa->get_config(child_sa)))
+		{
+			num_cpus = child_sa->get_num_cpus(child_sa);
+			break;
+		}
+	}
+	enumerator->destroy(enumerator);
+	return num_cpus;
+}
+
+/**
+ * Returns the number of CPUs that are configured on the system or only those
+ * that are currently online (if we can distinguish this).
+ */
+static uint32_t get_system_cpus(bool online)
+{
+	long cpus;
+
+#ifdef WIN32
+	SYSTEM_INFO sysinfo;
+	GetSystemInfo(&sysinfo);
+	cpus = sysinfo.dwNumberOfProcessors;
+#else /* WIN32 */
+	cpus = sysconf(online ? _SC_NPROCESSORS_ONLN : _SC_NPROCESSORS_CONF);
+
+	if (cpus < 0)
+	{
+		DBG1(DBG_IKE, "failed to determine number of CPUs for this system");
+		/* assume we have at least one CPU */
+		cpus = 1;
+	}
+#endif /* WIN32 */
+	return cpus;
+}
+
+/**
+ * Finds an unused CPU ID to be assigned to a responder's CHILD_SA.
+ */
+static uint32_t get_cpu(private_child_create_t *this)
+{
+	enumerator_t *enumerator;
+	hashtable_t *used;
+	child_sa_t *child_sa;
+	uint32_t cpu;
+
+	used = hashtable_create(hashtable_hash_ptr, hashtable_equals_ptr, 32);
+
+	enumerator = this->ike_sa->create_child_sa_enumerator(this->ike_sa);
+	while (enumerator->enumerate(enumerator, (void**)&child_sa))
+	{
+		if (child_sa->get_state(child_sa) == CHILD_INSTALLED &&
+			this->config->equals(this->config, child_sa->get_config(child_sa)))
+		{
+			cpu = child_sa->get_cpu(child_sa);
+			if (cpu != CPU_ID_MAX)
+			{
+				used->put(used, (void*)(uintptr_t)cpu, child_sa);
+			}
+		}
+	}
+	enumerator->destroy(enumerator);
+
+	/* FIXME: we need to know the valid CPU IDs here (at least the first one),
+	 * either via config or from the system somehow */
+	#define CPU_ID_MIN 0
+	cpu = get_system_cpus(TRUE) + CPU_ID_MIN - 1;
+	for (; cpu > CPU_ID_MIN; cpu--)
+	{
+		if (!used->get(used, (void*)(uintptr_t)cpu))
+		{
+			break;
+		}
+	}
+	used->destroy(used);
+	return cpu;
+}
+
+
+/**
  * build the payloads for the message
  */
 static bool build_payloads(private_child_create_t *this, message_t *message)
@@ -875,6 +987,23 @@ static bool build_payloads(private_child_create_t *this, message_t *message)
 		message->add_notify(message, FALSE, ESP_TFC_PADDING_NOT_SUPPORTED,
 							chunk_empty);
 	}
+
+	if (!this->rekey && this->child.num_cpus)
+	{
+		uint32_t value;
+
+		/* always send the number of queues */
+		value = htonl(get_system_cpus(FALSE));
+		message->add_notify(message, FALSE, NUM_QUEUES,
+							chunk_from_thing(value));
+
+		if (this->child.cpu != CPU_ID_MAX)
+		{	/* if we have a CPU ID, send that too */
+			value = htonl(this->child.cpu);
+			message->add_notify(message, FALSE, QUEUE_INFO,
+								chunk_from_thing(value));
+		}
+	}
 	return TRUE;
 }
 
@@ -903,6 +1032,8 @@ static void add_ipcomp_notify(private_child_create_t *this,
  */
 static void handle_notify(private_child_create_t *this, notify_payload_t *notify)
 {
+	chunk_t data;
+
 	switch (notify->get_notify_type(notify))
 	{
 		case USE_TRANSPORT_MODE:
@@ -923,7 +1054,6 @@ static void handle_notify(private_child_create_t *this, notify_payload_t *notify
 		{
 			ipcomp_transform_t ipcomp;
 			uint16_t cpi;
-			chunk_t data;
 
 			data = notify->get_notification_data(notify);
 			cpi = *(uint16_t*)data.ptr;
@@ -948,6 +1078,18 @@ static void handle_notify(private_child_create_t *this, notify_payload_t *notify
 			DBG1(DBG_IKE, "received %N, not using ESPv3 TFC padding",
 				 notify_type_names, notify->get_notify_type(notify));
 			this->tfcv3 = FALSE;
+			break;
+		case NUM_QUEUES:
+			data = notify->get_notification_data(notify);
+			this->num_queues = ntohl(*(uint32_t*)data.ptr);
+			if (!this->num_queues)
+			{
+				this->num_queues = 1;
+			}
+			break;
+		case QUEUE_INFO:
+			this->queue_info = chunk_clone(notify->get_notification_data(notify));
+			this->queue_info_seen = TRUE;
 			break;
 		default:
 			break;
@@ -1074,6 +1216,7 @@ static bool child_sa_equals(child_sa_t *a, child_sa_t *b)
 		a->get_mark(a, FALSE).value == b->get_mark(b, FALSE).value &&
 		a->get_if_id(a, TRUE) == b->get_if_id(b, TRUE) &&
 		a->get_if_id(a, FALSE) == b->get_if_id(b, FALSE) &&
+		a->get_cpu(a) == b->get_cpu(b) &&
 		sec_labels_equal(a->get_label(a), b->get_label(b));
 }
 
@@ -1252,6 +1395,19 @@ METHOD(task_t, build_i, status_t,
 	this->child.if_id_in_def = this->ike_sa->get_if_id(this->ike_sa, TRUE);
 	this->child.if_id_out_def = this->ike_sa->get_if_id(this->ike_sa, FALSE);
 	this->child.encap = this->ike_sa->has_condition(this->ike_sa, COND_NAT_ANY);
+	if (this->child.cpu != CPU_ID_MAX && !this->child.num_cpus)
+	{
+		this->child.num_cpus = get_num_cpus(this);
+	}
+	if (!this->child.num_cpus)
+	{	/* initiate regular SA or possible fallback for all CPUs */
+		this->child.cpu = CPU_ID_MAX;
+		this->child.num_cpus = 0;
+		if (this->config->has_option(this->config, OPT_PER_CPU_SAS))
+		{
+			this->child.num_cpus = get_system_cpus(FALSE);
+		}
+	}
 	this->child_sa = child_sa_create(this->ike_sa->get_my_host(this->ike_sa),
 									 this->ike_sa->get_other_host(this->ike_sa),
 									 this->config, &this->child);
@@ -1525,6 +1681,77 @@ static bool select_label(private_child_create_t *this)
 	return TRUE;
 }
 
+/**
+ * Handle queue information
+ */
+static bool handle_queues(private_child_create_t *this)
+{
+	notify_type_t expected = 0;
+
+	/* verify received notifies */
+	if (this->initiator)
+	{
+		if (this->child.cpu == CPU_ID_MAX)
+		{	/* if we initiated a fallback SA for all CPUs, we require
+			 * NUM_QUEUES, otherwise, create a regular SA, ignore QUEUE_INFO as
+			 * we didn't send one */
+			if (!this->num_queues)
+			{
+				expected = NUM_QUEUES;
+			}
+			else if (this->queue_info_seen)
+			{
+				DBG1(DBG_IKE, "peer sent %N (%u) and %N (%+B) notifies, ignoring "
+					 "%N", notify_type_names, NUM_QUEUES, this->num_queues,
+					 notify_type_names, QUEUE_INFO, &this->queue_info,
+					 notify_type_names, QUEUE_INFO);
+				this->queue_info_seen = FALSE;
+			}
+		}
+		else if (!this->num_queues || !this->queue_info_seen)
+		{	/* expect both notifies for per-CPU SAs, otherwise, create a
+			 * regular SA */
+			expected = QUEUE_INFO;
+		}
+	}
+	/* as responder we create a regular SA if we don't receive at least
+	 * NUM_QUEUES */
+	else if (!this->num_queues)
+	{
+		expected = NUM_QUEUES;
+	}
+
+	if (expected)
+	{
+		DBG1(DBG_IKE, "peer didn't send %N notify, creating regular SA",
+			 notify_type_names, expected);
+		this->child.num_cpus = 0;
+		this->child.cpu = CPU_ID_MAX;
+		return TRUE;
+	}
+
+	if (this->num_queues)
+	{
+		this->child.num_cpus = max(this->num_queues, get_system_cpus(FALSE));
+	}
+	if (this->queue_info_seen)
+	{
+		if (!this->initiator)
+		{
+			this->child.cpu = get_cpu(this);
+		}
+		DBG1(DBG_IKE, "creating SA as one of %u potential queues (our ID %u, "
+			 "peer's ID %+B)", this->child.num_cpus, this->child.cpu,
+			 &this->queue_info);
+	}
+	else
+	{
+		DBG1(DBG_IKE, "creating SA with %u potential queues",
+			 this->child.num_cpus);
+	}
+	return TRUE;
+}
+
 METHOD(task_t, build_r, status_t,
 	private_child_create_t *this, message_t *message)
 {
@@ -1643,6 +1870,18 @@ METHOD(task_t, build_r, status_t,
 	this->child.if_id_in_def = this->ike_sa->get_if_id(this->ike_sa, TRUE);
 	this->child.if_id_out_def = this->ike_sa->get_if_id(this->ike_sa, FALSE);
 	this->child.encap = this->ike_sa->has_condition(this->ike_sa, COND_NAT_ANY);
+
+	if (!this->rekey && this->config->has_option(this->config, OPT_PER_CPU_SAS))
+	{
+		if (!handle_queues(this))
+		{
+			message->add_notify(message, FALSE, INVALID_SYNTAX, chunk_empty);
+			return FAILED;
+		}
+		/* FIXME: we could check if we already have "too many" SAs and reject
+		 * this one with TS_UNACCEPTABLE, but for now we just keep it */
+	}
+
 	this->child_sa = child_sa_create(this->ike_sa->get_my_host(this->ike_sa),
 									 this->ike_sa->get_other_host(this->ike_sa),
 									 this->config, &this->child);
@@ -1904,6 +2143,17 @@ METHOD(task_t, process_i, status_t,
 		return delete_failed_sa(this);
 	}
 
+	if (!this->rekey && this->config->has_option(this->config, OPT_PER_CPU_SAS))
+	{
+		if (!handle_queues(this))
+		{
+			handle_child_sa_failure(this, message);
+			return delete_failed_sa(this);
+		}
+		/* the peer might have sent a larger number back */
+		this->child_sa->set_num_cpus(this->child_sa, this->child.num_cpus);
+	}
+
 	if (select_and_install(this, no_dh, ike_auth) == SUCCESS)
 	{
 		if (!this->rekey)
@@ -1944,6 +2194,18 @@ METHOD(child_create_t, use_label, void,
 {
 	DESTROY_IF(this->child.label);
 	this->child.label = label ? label->clone(label) : NULL;
+}
+
+METHOD(child_create_t, use_num_cpus, void,
+	private_child_create_t *this, uint32_t num_cpus)
+{
+	this->child.num_cpus = num_cpus;
+}
+
+METHOD(child_create_t, use_cpu, void,
+	private_child_create_t *this, uint32_t cpu)
+{
+	this->child.cpu = cpu;
 }
 
 METHOD(child_create_t, use_dh_group, void,
@@ -1990,6 +2252,7 @@ METHOD(task_t, migrate, void,
 {
 	chunk_free(&this->my_nonce);
 	chunk_free(&this->other_nonce);
+	chunk_free(&this->queue_info);
 	if (this->tsr)
 	{
 		this->tsr->destroy_offset(this->tsr, offsetof(traffic_selector_t, destroy));
@@ -2033,6 +2296,8 @@ METHOD(task_t, migrate, void,
 	this->ipcomp_received = IPCOMP_NONE;
 	this->other_cpi = 0;
 	this->established = FALSE;
+	this->num_queues = 0;
+	this->queue_info_seen = FALSE;
 	this->public.task.build = _build_i;
 }
 
@@ -2041,6 +2306,7 @@ METHOD(task_t, destroy, void,
 {
 	chunk_free(&this->my_nonce);
 	chunk_free(&this->other_nonce);
+	chunk_free(&this->queue_info);
 	if (this->tsr)
 	{
 		this->tsr->destroy_offset(this->tsr, offsetof(traffic_selector_t, destroy));
@@ -2093,6 +2359,8 @@ child_create_t *child_create_create(ike_sa_t *ike_sa,
 			.use_marks = _use_marks,
 			.use_if_ids = _use_if_ids,
 			.use_label = _use_label,
+			.use_num_cpus = _use_num_cpus,
+			.use_cpu = _use_cpu,
 			.use_dh_group = _use_dh_group,
 			.task = {
 				.get_type = _get_type,
