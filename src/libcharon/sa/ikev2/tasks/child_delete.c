@@ -372,6 +372,7 @@ static status_t destroy_and_reestablish(private_child_delete_t *this)
 		{
 			args.label = args.label->clone(args.label);
 		}
+		args.cpu = child_sa->get_cpu(child_sa);
 		action = child_sa->get_close_action(child_sa);
 
 		this->ike_sa->destroy_child_sa(this->ike_sa, protocol, spi);
