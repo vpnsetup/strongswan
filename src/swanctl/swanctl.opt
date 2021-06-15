@@ -1071,6 +1071,9 @@ connections.<conn>.children.<child>.replay_window = 32
 connections.<conn>.children.<child>.per_cpu_sas = no
 	Enable per-CPU CHILD_SAs. Requires _start_action=trap_.
 
+	Enable per-CPU CHILD_SAs. Use the value _encap_ to enable UDP encapsulation
+	for outbound per-CPU SAs. Requires _start_action=trap_.
+
 connections.<conn>.children.<child>.hw_offload = no
 	Enable hardware offload for this CHILD_SA, if supported by the IPsec
 	implementation.

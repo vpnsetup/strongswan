@@ -985,6 +985,16 @@ CALLBACK(parse_opt_copy_ecn, bool,
 CALLBACK(parse_opt_cpus, bool,
 	child_cfg_option_t *out, chunk_t v)
 {
+	enum_map_t map[] = {
+		{ "encap",	OPT_PER_CPU_SAS|OPT_PER_CPU_SAS_ENCAP	},
+	};
+	int d;
+
+	if (parse_map(map, countof(map), &d, v))
+	{
+		*out |= d;
+		return TRUE;
+	}
 	return parse_option(out, OPT_PER_CPU_SAS, v, TRUE);
 }
 
