@@ -911,6 +911,15 @@ static status_t install_internal(private_child_sa_t *this, chunk_t encr,
 		dst_ts = my_ts;
 		src_ts = other_ts;
 		this->inbound_installed = TRUE;
+		if (this->num_cpus &&
+			this->config->has_option(this->config, OPT_PER_CPU_SAS_ENCAP))
+		{
+			src = src->clone(src);
+			/* FIXME: allow inbound traffic from any port, maybe have to force
+			 * destination port to 4500 (or do that via IKE if this is used) */
+			src->set_port(src, 0);
+			this->encap = TRUE;
+		}
 	}
 	else
 	{
@@ -928,6 +937,15 @@ static status_t install_internal(private_child_sa_t *this, chunk_t encr,
 		if (this->num_cpus)
 		{
 			cpu = this->cpu;
+		}
+		if (this->num_cpus &&
+			this->config->has_option(this->config, OPT_PER_CPU_SAS_ENCAP))
+		{
+			src = src->clone(src);
+			/* FIXME: proper randomization, probably also store the port, and
+			 * maybe also change the destination to 4500 */
+			src->set_port(src, 0xc000 | (random() & 0xffff));
+			this->encap = TRUE;
 		}
 		this->outbound_state |= CHILD_OUTBOUND_SA;
 	}
@@ -1036,6 +1054,10 @@ static status_t install_internal(private_child_sa_t *this, chunk_t encr,
 
 	status = charon->kernel->add_sa(charon->kernel, &id, &sa);
 
+	if (src != this->my_addr && src != this->other_addr)
+	{
+		src->destroy(src);
+	}
 	my_ts->destroy(my_ts);
 	other_ts->destroy(other_ts);
 	free(lifetime);
